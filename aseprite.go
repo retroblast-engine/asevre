@@ -14,6 +14,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/hajimehoshi/ebiten/v2"
 )
 
 // AsepriteSprite represents a parsed Aseprite file.
@@ -22,6 +25,10 @@ type AsepriteSprite struct {
 	States  map[string][]TileMap // Maps state names to their tilemaps
 }
 
+type Sprites struct {
+	Current *ebiten.Image
+	All     []*ebiten.Image
+}
 type Color struct {
 	Red   BYTE
 	Green BYTE
@@ -1358,14 +1365,26 @@ func parseFLIColorChunk(data []byte) (*FLIColorChunk, error) {
 	}, nil
 }
 
+type Animation struct {
+	TotalFrames int
+	Index       int
+	Duration    []time.Duration // how long the current frame should be displayed
+	LastChange  time.Time       // is updated to the current time each time the frame changes
+}
+
 type ASEFile struct {
 	State   []ASETag
 	Tileset ASETileset
+	Sprites Sprites
 }
 
 type ASETag struct {
-	Name     string
-	Tilemaps []ASETilemap
+	Name          string
+	Tilemaps      []ASETilemap
+	Frames        []*ebiten.Image
+	FrameDuration [][]time.Duration
+	HasAnimations bool
+	Animation     Animation
 }
 
 type ASETileset struct {
@@ -1435,9 +1454,11 @@ func ParseAseprite(f string) (ASEFile, error) {
 	tileset := ASETileset{}
 	tilemaps := []ASETilemap{}
 	states := []ASETag{}
+	frameImages := []image.Image{}
+	framesDuration := []time.Duration{}
 
 	var palette []color.Color
-	_, frames, err := readAsepriteFile(f)
+	header, frames, err := readAsepriteFile(f)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return ASEFile{}, err
@@ -1445,6 +1466,7 @@ func ParseAseprite(f string) (ASEFile, error) {
 
 	// Parse the palette
 	for _, frame := range frames {
+		framesDuration = append(framesDuration, time.Duration(frame.Header.FrameDuration)*time.Millisecond)
 		for _, chunk := range frame.Chunks {
 
 			switch chunk.ChunkType {
@@ -1475,6 +1497,12 @@ func ParseAseprite(f string) (ASEFile, error) {
 			}
 		}
 	}
+
+	// fmt.Println("======================")
+	// for i, k := range framesDuration {
+	// 	fmt.Printf("Frame %d: %v\n", i, k)
+	// }
+	// fmt.Println("======================")
 
 	// // Print palette colors
 	// for i, c := range palette {
@@ -1587,19 +1615,159 @@ func ParseAseprite(f string) (ASEFile, error) {
 					rawImage.Width = WORD(celChunk.Data[0]) | WORD(celChunk.Data[1])<<8
 					rawImage.Height = WORD(celChunk.Data[2]) | WORD(celChunk.Data[3])<<8
 					rawImage.Pixels = celChunk.Data[4:]
-					fmt.Printf("      > Raw Image Data: %dx%d pixels\n", rawImage.Width, rawImage.Height)
+					// fmt.Printf("      > Raw Image Data: %dx%d pixels\n", rawImage.Width, rawImage.Height)
 				case LinkedCelData:
 					// Linked Cel Data
 					linkedCel := LinkedCel{}
 					linkedCel.FramePosition = WORD(celChunk.Data[0]) | WORD(celChunk.Data[1])<<8
-					fmt.Printf("      > Linked Cel Data: Frame Position: %d\n", linkedCel.FramePosition)
+					// fmt.Printf("      > Linked Cel Data: Frame Position: %d\n", linkedCel.FramePosition)
 				case CompressedImageData:
 					// Compressed Image Data
+
+					// Get GetColorDepthDescription from the header
+					colorDepth := header.GetColorDepthDescription()
+					var bitsPerPixel int
+					switch colorDepth {
+					case "RGBA":
+						bitsPerPixel = 32
+					case "Grayscale":
+						bitsPerPixel = 16
+					case "Indexed":
+						bitsPerPixel = 8
+					default:
+						bitsPerPixel = 0
+					}
+
+					if bitsPerPixel == 0 {
+						return ASEFile{}, fmt.Errorf("unknown color depth: %s", colorDepth)
+					}
+
+					// fmt.Println("Color Depth:", colorDepth)
+					// fmt.Println("Bits per Pixel:", bitsPerPixel)
+
 					compressedImage := CompressedImage{}
 					compressedImage.Width = WORD(celChunk.Data[0]) | WORD(celChunk.Data[1])<<8
 					compressedImage.Height = WORD(celChunk.Data[2]) | WORD(celChunk.Data[3])<<8
 					compressedImage.Pixels = celChunk.Data[4:]
-					fmt.Printf("      > Compressed Image Data: %dx%d pixels\n", compressedImage.Width, compressedImage.Height)
+					// fmt.Printf("      > Compressed Image Data: %dx%d pixels\n", compressedImage.Width, compressedImage.Height)
+
+					decompressedPixels, err := decompressZlib(compressedImage.Pixels)
+					if err != nil {
+						return ASEFile{}, fmt.Errorf("error decompressing image data: %v", err)
+					}
+
+					var pixels []PIXEL
+
+					rowsOfPixels := make([][]PIXEL, compressedImage.Height)
+					columnsOfPixels := make([]PIXEL, compressedImage.Width)
+
+					// Iterate over the decompressed pixels
+					// Each pixel has bits per pixel: bitsPerPixel bits
+					// The pixels are stored in rows, from top to bottom, left to right
+					for i := 0; i < len(decompressedPixels); i += bitsPerPixel / 8 {
+						// Ensure we don't go out of bounds
+						if i+bitsPerPixel/8 > len(decompressedPixels) {
+							break
+						}
+
+						// Extract the current pixel
+						pixel := decompressedPixels[i : i+bitsPerPixel/8]
+
+						// Depending of the bitsPerPixel, we can have different color depths
+						// and store them in different ways (RGBA, Grayscale, Indexed) in pixels
+						switch bitsPerPixel {
+						case 32:
+							// RGBA color depth
+							// Each pixel is stored as 4 bytes (32 bits)
+							// The order of the bytes is: RGBA (Red, Green, Blue, Alpha)
+							// The color values are in the range [0, 255]
+							pixels = append(pixels, PIXEL{
+								RGBA: [4]BYTE{pixel[0], pixel[1], pixel[2], pixel[3]},
+							})
+						// case 16:
+						// 	// Grayscale color depth
+						// 	// Each pixel is stored as 2 bytes (16 bits)
+						// 	// The color value is in the range [0, 255]
+						// 	// The grayscale value is stored in the Red channel
+						// 	pixels = append(pixels, PIXEL{
+						// 		Grayscale: pixel[0:2],
+						// 	})
+						case 8:
+							// Indexed color depth
+							// Each pixel is stored as 1 byte (8 bits)
+							// The color value is an index to the palette
+							// The color value is in the range [0, 255]
+							pixels = append(pixels, PIXEL{
+								Indexed: pixel[0],
+							})
+						}
+					}
+
+					// Reconstruct the pixels
+					// Row by row, from top to bottom, left to right
+					for row := 0; row < int(compressedImage.Height); row++ {
+						// Iterate over the pixels in the row
+						for col := 0; col < int(compressedImage.Width); col++ {
+							// Calculate the offset in the decompressed pixel data
+							offset := row*int(compressedImage.Width) + col
+
+							// Read the pixel
+							pixel := pixels[offset]
+
+							// Store the pixel in the columnsOfPixels slice
+							columnsOfPixels[col] = pixel
+						}
+
+						// Store the columnsOfPixels slice in the rowsOfPixels slice
+						rowsOfPixels[row] = make([]PIXEL, len(columnsOfPixels))
+						copy(rowsOfPixels[row], columnsOfPixels)
+					}
+
+					// Save into a PNG image
+					// Create a new RGBA image
+					img := image.NewRGBA(image.Rect(0, 0, int(compressedImage.Width), int(compressedImage.Height)))
+
+					// Set the pixels of the PNG Image
+					for i := 0; i < int(compressedImage.Height); i++ {
+						for j := 0; j < int(compressedImage.Width); j++ {
+							p := rowsOfPixels[i][j]
+
+							// Get the color from the palette
+							var col color.Color
+							if bitsPerPixel == 8 {
+								col = palette[p.Indexed]
+							} else {
+								col = color.RGBA{R: p.RGBA[0], G: p.RGBA[1], B: p.RGBA[2], A: p.RGBA[3]}
+							}
+
+							// Set the pixel color in the PNG image
+							img.Set(j, i, col)
+						}
+					}
+
+					// Save the PNG image to a file
+
+					// // Create a new file
+					// f, err := os.Create("image.png")
+					// if err != nil {
+					// 	return ASEFile{}, fmt.Errorf("error creating PNG file: %v", err)
+					// }
+
+					// // Encode the PNG image
+					// err = png.Encode(f, img)
+					// if err != nil {
+					// 	return ASEFile{}, fmt.Errorf("error encoding PNG image: %v", err)
+					// }
+
+					// // Close the file
+					// err = f.Close()
+					// if err != nil {
+					// 	return ASEFile{}, fmt.Errorf("error closing PNG file: %v", err)
+					// }
+
+					// Append img to frameImages
+					frameImages = append(frameImages, img)
+
 				case CompressedTilemapData:
 					// Compressed Tilemap Data
 					compressedTilemap := CompressedTilemap{}
@@ -1754,6 +1922,7 @@ func ParseAseprite(f string) (ASEFile, error) {
 	}
 
 	for _, frame := range frames {
+
 		for _, chunk := range frame.Chunks {
 
 			switch chunk.ChunkType {
@@ -1766,7 +1935,7 @@ func ParseAseprite(f string) (ASEFile, error) {
 					os.Exit(1)
 				}
 
-				for _, tag := range tagsChunk.Tags {
+				for stateIndex, tag := range tagsChunk.Tags {
 					name := string(tag.TagName.Chars)
 					from := tag.FromFrame
 					to := tag.ToFrame
@@ -1775,18 +1944,50 @@ func ParseAseprite(f string) (ASEFile, error) {
 					}
 
 					for i := from; i <= to; i++ {
-						state.Tilemaps = append(state.Tilemaps, tilemaps[i])
+						if len(tilemaps) != 0 {
+							state.Tilemaps = append(state.Tilemaps, tilemaps[i])
+						}
+
+						if len(frameImages) != 0 {
+							state.Frames = append(state.Frames, ebiten.NewImageFromImage(frameImages[i]))
+						}
+					}
+
+					// Calculate the number of frames for the current state
+					numFrames := to - from + 1
+
+					// Initialize the inner slice for the current state
+					state.FrameDuration = make([][]time.Duration, len(tagsChunk.Tags))
+
+					// Populate the inner slice with the appropriate elements from framesDuration
+					state.FrameDuration[stateIndex] = make([]time.Duration, numFrames)
+					for i := 0; i < int(numFrames); i++ {
+						state.FrameDuration[stateIndex][i] = framesDuration[int(from)+i]
+					}
+
+					if len(state.Frames) > 1 {
+						state.HasAnimations = true
+
+						state.Animation = Animation{
+							TotalFrames: len(state.Frames),
+							Index:       0,
+							LastChange:  time.Now(),
+							Duration:    state.FrameDuration[stateIndex],
+						}
 					}
 
 					states = append(states, state)
 				}
-
 			}
 		}
 	}
 
 	asepriteFile.Tileset = tileset
+
 	asepriteFile.State = states
+	// for stateIdx, state := range states {
+	// 	for
+	// }
 
 	return asepriteFile, nil
 }
