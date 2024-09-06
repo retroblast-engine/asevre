@@ -1607,6 +1607,8 @@ func ParseAseprite(f string) (ASEFile, error) {
 					os.Exit(1)
 				}
 
+				// fmt.Printf("Cel Chunk Position X: %d, Y: %d\n", celChunk.XPosition, celChunk.YPosition)
+
 				// Read specific fields based on CelType
 				switch celChunk.CelType {
 				case RawImageData:
@@ -1660,6 +1662,15 @@ func ParseAseprite(f string) (ASEFile, error) {
 
 					rowsOfPixels := make([][]PIXEL, compressedImage.Height)
 					columnsOfPixels := make([]PIXEL, compressedImage.Width)
+
+					// Adjust dimensions to account for transparent rows and columns
+					totalWidth := uint16(celChunk.XPosition) + compressedImage.Width
+					totalHeight := uint16(celChunk.YPosition) + compressedImage.Height
+
+					rowsOfPixels = make([][]PIXEL, totalHeight)
+					for i := range rowsOfPixels {
+						rowsOfPixels[i] = make([]PIXEL, totalWidth)
+					}
 
 					// Iterate over the decompressed pixels
 					// Each pixel has bits per pixel: bitsPerPixel bits
@@ -1715,24 +1726,24 @@ func ParseAseprite(f string) (ASEFile, error) {
 							pixel := pixels[offset]
 
 							// Store the pixel in the columnsOfPixels slice
+							rowsOfPixels[int16(row)+celChunk.YPosition][int16(col)+celChunk.XPosition] = pixel
 							columnsOfPixels[col] = pixel
 						}
 
-						// Store the columnsOfPixels slice in the rowsOfPixels slice
-						rowsOfPixels[row] = make([]PIXEL, len(columnsOfPixels))
-						copy(rowsOfPixels[row], columnsOfPixels)
+						// // Store the columnsOfPixels slice in the rowsOfPixels slice
+						// rowsOfPixels[row] = make([]PIXEL, len(columnsOfPixels))
+						// copy(rowsOfPixels[row], columnsOfPixels)
 					}
 
 					// Save into a PNG image
-					// Create a new RGBA image
-					img := image.NewRGBA(image.Rect(0, 0, int(compressedImage.Width), int(compressedImage.Height)))
+					// Create a new RGBA image with the adjusted dimensions
+					img := image.NewRGBA(image.Rect(0, 0, int(totalWidth), int(totalHeight)))
 
 					// Set the pixels of the PNG Image
-					for i := 0; i < int(compressedImage.Height); i++ {
-						for j := 0; j < int(compressedImage.Width); j++ {
+					for i := 0; i < int(totalHeight); i++ {
+						for j := 0; j < int(totalWidth); j++ {
 							p := rowsOfPixels[i][j]
 
-							// Get the color from the palette
 							var col color.Color
 							if bitsPerPixel == 8 {
 								col = palette[p.Indexed]
@@ -1740,7 +1751,6 @@ func ParseAseprite(f string) (ASEFile, error) {
 								col = color.RGBA{R: p.RGBA[0], G: p.RGBA[1], B: p.RGBA[2], A: p.RGBA[3]}
 							}
 
-							// Set the pixel color in the PNG image
 							img.Set(j, i, col)
 						}
 					}
@@ -1748,7 +1758,7 @@ func ParseAseprite(f string) (ASEFile, error) {
 					// Save the PNG image to a file
 
 					// // Create a new file
-					// f, err := os.Create("image.png")
+					// f, err := os.Create(fmt.Sprintf("frame_%d.png", len(frameImages)))
 					// if err != nil {
 					// 	return ASEFile{}, fmt.Errorf("error creating PNG file: %v", err)
 					// }
