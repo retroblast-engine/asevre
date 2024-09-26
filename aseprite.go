@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"compress/zlib"
+	"embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1060,28 +1061,33 @@ func (header *Header) printHeader() {
 }
 
 // readAsepriteFile reads and parses the header, frame headers, and chunks of an .aseprite or .ase file
-func readAsepriteFile(filePath string) (*Header, []Frame, error) {
+func readAsepriteFile(assets embed.FS, filePath string) (*Header, []Frame, error) {
 	ext := filepath.Ext(filePath)
 	if ext != ".aseprite" && ext != ".ase" {
 		return nil, nil, fmt.Errorf("unsupported file type: %s", ext)
 	}
 
-	file, err := os.Open(filePath)
+	file, err := assets.Open(filePath)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer file.Close()
 
-	// Get the file size
-	fileInfo, err := file.Stat()
+	// Read the file content into a byte slice
+	fileContent, err := io.ReadAll(file)
 	if err != nil {
 		return nil, nil, err
 	}
-	fileSize := fileInfo.Size()
+
+	// Create a bytes.Reader to read from the byte slice
+	reader := bytes.NewReader(fileContent)
+
+	// Get the file size
+	fileSize := int64(len(fileContent))
 
 	// Read the header (128 bytes)
 	header := &Header{}
-	err = binary.Read(file, binary.LittleEndian, header)
+	err = binary.Read(reader, binary.LittleEndian, header)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1100,7 +1106,7 @@ func readAsepriteFile(filePath string) (*Header, []Frame, error) {
 		// Each frame has this little header of 16 bytes:
 		// ==============================================
 		frameHeader := &FrameHeader{}
-		err = binary.Read(file, binary.LittleEndian, frameHeader)
+		err = binary.Read(reader, binary.LittleEndian, frameHeader)
 		if err != nil {
 			fmt.Println("Error reading frame header:", err)
 			return nil, nil, err
@@ -1120,13 +1126,13 @@ func readAsepriteFile(filePath string) (*Header, []Frame, error) {
 			chunk := Chunk{}
 
 			// Chunk size info (takes 4 bytes to store it)
-			err = binary.Read(file, binary.LittleEndian, &chunk.ChunkSize)
+			err = binary.Read(reader, binary.LittleEndian, &chunk.ChunkSize)
 			if err != nil {
 				return nil, nil, err
 			}
 
 			// Chunk type info (takes 2 bytes to store it)
-			err = binary.Read(file, binary.LittleEndian, &chunk.ChunkType)
+			err = binary.Read(reader, binary.LittleEndian, &chunk.ChunkType)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1137,7 +1143,7 @@ func readAsepriteFile(filePath string) (*Header, []Frame, error) {
 			}
 
 			chunk.ChunkData = make([]BYTE, chunk.ChunkSize-6) // 6 bytes are already read (4 bytes for ChunkSize + 2 bytes for ChunkType)
-			err = binary.Read(file, binary.LittleEndian, &chunk.ChunkData)
+			err = binary.Read(reader, binary.LittleEndian, &chunk.ChunkData)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1166,7 +1172,7 @@ func readAsepriteFile(filePath string) (*Header, []Frame, error) {
 	}
 
 	// Check if there are any bytes left non-parsed
-	currentOffset, err := file.Seek(0, io.SeekCurrent)
+	currentOffset, err := reader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1449,7 +1455,7 @@ func parseChunk0x2018(data []byte) (*Chucnk0x2018, error) {
 	return chunk, nil
 }
 
-func ParseAseprite(f string) (ASEFile, error) {
+func ParseAseprite(assets embed.FS, f string) (ASEFile, error) {
 	asepriteFile := ASEFile{}
 	tileset := ASETileset{}
 	tilemaps := []ASETilemap{}
@@ -1458,7 +1464,7 @@ func ParseAseprite(f string) (ASEFile, error) {
 	framesDuration := []time.Duration{}
 
 	var palette []color.Color
-	header, frames, err := readAsepriteFile(f)
+	header, frames, err := readAsepriteFile(assets, f)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return ASEFile{}, err
